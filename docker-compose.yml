@@ -1,0 +1,118 @@
+name: hotel-offer-orchestrator
+
+services:
+  postgresql:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U temporal']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: temporal
+      POSTGRES_SEEDS: postgresql
+    ports:
+      - '7233:7233'
+
+  # Optional, but makes the orchestration visible: every workflow execution,
+  # its activity attempts and its retries are inspectable at localhost:8080.
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    depends_on:
+      - temporal
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:3000
+    ports:
+      - '8080:8080'
+
+  redis:
+    image: redis:7-alpine
+    command: ['redis-server', '--appendonly', 'no']
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    environment:
+      PORT: 3000
+      LOG_LEVEL: info
+      SERVICE_NAME: api
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: hotel-offers
+      REDIS_URL: redis://redis:6379
+      CACHE_TTL_SECONDS: 300
+      SUPPLIER_A_URL: http://api:3000/supplierA/hotels
+      SUPPLIER_B_URL: http://api:3000/supplierB/hotels
+      SUPPLIER_TIMEOUT_MS: 5000
+      # Overridable for the degraded-search demo:
+      #   SUPPLIER_A_DOWN=true docker compose up -d api
+      SUPPLIER_A_DOWN: ${SUPPLIER_A_DOWN:-false}
+      SUPPLIER_B_DOWN: ${SUPPLIER_B_DOWN:-false}
+    ports:
+      - '3000:3000'
+    # Temporal's own startup (schema setup on first boot) takes longer than the
+    # app's connect timeout, so let the process die and be restarted rather than
+    # blocking the whole stack behind a fragile healthcheck on the server image.
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  worker:
+    build: .
+    command: ['node', 'dist/temporal/worker.js']
+    depends_on:
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    environment:
+      LOG_LEVEL: info
+      SERVICE_NAME: worker
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: hotel-offers
+      REDIS_URL: redis://redis:6379
+      CACHE_TTL_SECONDS: 300
+      # The worker reaches the mock suppliers over the compose network, exactly
+      # as it would reach a real third party over the internet.
+      SUPPLIER_A_URL: http://api:3000/supplierA/hotels
+      SUPPLIER_B_URL: http://api:3000/supplierB/hotels
+      SUPPLIER_TIMEOUT_MS: 5000
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
